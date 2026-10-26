@@ -1,8 +1,11 @@
-// server.mjs — OpenAI-compatible HTTP surface (drop-in for the omni bridge):
+// server.mjs — local HTTP surface (drop-in for the omni bridge):
 //   GET  /health /ready /metrics /v1/models /models
 //   POST /v1/chat/completions /chat/completions  (stream + non-stream)
+//   POST /v1/responses /responses                (OpenAI Responses, Codex)
+//   POST /v1/messages /messages                  (Anthropic Messages, Claude Code)
 //   POST /recaptcha
-// Includes Bearer auth, rate limiting, request-size limits and precise errors.
+// Includes Bearer or x-api-key auth, rate limiting, request-size limits and precise errors.
+// Responses and Messages are translators over the chat-completion driver below.
 //
 // arena-local-bridge contract: a UUID `model` (e.g. "01a0b8d8-...") is treated as
 // an EXISTING Arena session id and routed to the converse-only driver (never
@@ -37,6 +40,20 @@ import {
 } from "./pool.mjs";
 import { WORKSPACE_HEADER } from "./mcp-preamble.mjs";
 import { listRecentCodexWorkspaces } from "./codex-workspace.mjs";
+import {
+  ADVERTISED_ENDPOINTS,
+  ENDPOINT_HINT,
+  anthropicErrorBody,
+  anthropicToChat,
+  assistantTranscriptMessage,
+  chatToAnthropic,
+  chatToResponse,
+  continueFromPrevious,
+  createAnthropicStream,
+  createResponseStream,
+  matchCompletionRoute,
+  responsesToChat,
+} from "./wire.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -240,6 +257,14 @@ export function exposesBridgeKey(config) {
   return LOCAL_HOSTS.has(String(config?.host || "").toLowerCase());
 }
 
+/** Authorization: Bearer and x-api-key are the same bridge key. Either match is enough. */
+export function bridgeKeyMatches(headers, expected) {
+  if (!expected) return false;
+  const bearer = String(headers?.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  const apiKey = String(headers?.["x-api-key"] || "").trim();
+  return bearer === expected || apiKey === expected;
+}
+
 function json(res, status, value, headers = {}) {
   const body = JSON.stringify(value);
   res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), ...headers });
@@ -327,6 +352,10 @@ export function createServer({ bridge, config }) {
   // navigate the shared browser page while one is running.
   let turnsInFlight = 0;
   let accountLoginPending = false;
+  // Last few Responses transcripts, keyed by the id we returned. Process-local
+  // only: a restart drops it, and a full `input` replay never consults it.
+  const responseMemory = new Map();
+  const RESPONSE_MEMORY_LIMIT = 32;
 
   /**
    * Accounts with their last quota reading attached. The reading is a cached
@@ -380,6 +409,92 @@ export function createServer({ bridge, config }) {
     sessions: readArchiveSessions(config.archiveDir),
   });
 
+  function rememberResponse(id, messages, payload) {
+    responseMemory.set(id, [...messages, assistantTranscriptMessage(payload)]);
+    while (responseMemory.size > RESPONSE_MEMORY_LIMIT) {
+      const oldest = responseMemory.keys().next().value;
+      responseMemory.delete(oldest);
+    }
+  }
+
+  /**
+   * Resolve which Arena session a chat-shaped body drives, and the account
+   * that owns it. Throws the same 409s the chat route always has. Called
+   * before SSE headers so those failures stay real HTTP statuses.
+   */
+  function prepareChatTurn(body, headers) {
+    const model = (body.model || "active").trim();
+    const clientSid = clientSessionId(headers);
+    let target = null;
+    if (isSessionId(model)) {
+      target = model;
+      if (clientSid) {
+        poolState = bind(poolState, clientSid, target, new Date().toISOString());
+        savePoolState(config, poolState);
+      }
+    } else if (model === "active") {
+      if (clientSid) {
+        const bound = resolveBinding(poolState, clientSid);
+        if (bound.ok) {
+          target = bound.sessionId;
+        } else if (bound.code === "bound_session_dead") {
+          throw Object.assign(
+            new Error(
+              `Your bound session ${bound.sessionId} is marked suspected-dead. ` +
+                'Pick another session (GUI → 选用此模型, or pass its UUID as model), ' +
+                `or POST /api/pool/unbind with clientId "${clientSid}" to drop the binding.`
+            ),
+            { status: 409, code: "bound_session_dead" }
+          );
+        }
+      }
+      if (!target) {
+        if (!activeSession) throw noActiveSessionError();
+        target = activeSession;
+      }
+    }
+    const accountEmail = target ? sessionAccountEmail(config.archiveDir, target) : "";
+    let account = null;
+    if (target) account = bridge.credentials.forSession(accountEmail);
+    return { model, target, account, accountEmail };
+  }
+
+  async function executeChatTurn(prepared, body, headers, onDelta) {
+    const { model, target, account, accountEmail } = prepared;
+    if (model === "ping" || model === "health") {
+      return {
+        id: `chatcmpl-arena-ping-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
+    }
+    if (target) {
+      turnsInFlight += 1;
+      let payload;
+      try {
+        payload = await bridge.converse(target, body, { onDelta, headers, account, accountEmail });
+        poolState = markUsed(poolState, target, new Date().toISOString());
+      } catch (error) {
+        poolState = markDead(poolState, target, new Date().toISOString());
+        savePoolState(config, poolState);
+        throw error;
+      } finally {
+        turnsInFlight -= 1;
+      }
+      savePoolState(config, poolState);
+      return payload;
+    }
+    turnsInFlight += 1;
+    try {
+      return await bridge.runAgent(body, headers);
+    } finally {
+      turnsInFlight -= 1;
+    }
+  }
+
   const server = http.createServer(async (req, res) => {
     // Only this machine may talk to us — see isLocalRequest() for why the
     // loopback bind alone is not enough.
@@ -401,6 +516,7 @@ export function createServer({ bridge, config }) {
     if (url.pathname === "/health" || url.pathname === "/ready") {
       const payload = bridge.healthPayload();
       payload.accounts = accountsWithQuota();
+      payload.endpoints = ADVERTISED_ENDPOINTS;
       if (url.pathname === "/ready" && !payload.ready) {
         payload.ok = false;
         return json(res, 503, payload);
@@ -461,6 +577,9 @@ export function createServer({ bridge, config }) {
         origin,
         apiBase: `${origin}/v1`,
         chatEndpoint: `${origin}/v1/chat/completions`,
+        responsesEndpoint: `${origin}/v1/responses`,
+        messagesEndpoint: `${origin}/v1/messages`,
+        endpoints: ADVERTISED_ENDPOINTS,
         proxyUrl: `${origin}/v1`,
         apiKey: exposesBridgeKey(config) ? config.bridgeKey : "",
         activeSession,
@@ -472,8 +591,13 @@ export function createServer({ bridge, config }) {
     // Hardened: authenticate before serving any other route. Previously
     // /metrics, /recaptcha and /v1/models answered without a bridge key, so
     // any local process could mint reCAPTCHA tokens with your account.
-    const auth = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-    if (!config.bridgeKey || auth !== config.bridgeKey) {
+    if (!bridgeKeyMatches(req.headers, config.bridgeKey)) {
+      if (url.pathname === "/v1/messages" || url.pathname === "/messages") {
+        return json(res, 401, {
+          type: "error",
+          error: { type: "authentication_error", message: "Invalid bridge key" },
+        });
+      }
       return json(res, 401, { error: { message: "Invalid bridge key" } });
     }
 
@@ -922,7 +1046,8 @@ export function createServer({ bridge, config }) {
       }
     }
 
-    if (req.method !== "POST" || !["/v1/chat/completions", "/chat/completions"].includes(url.pathname)) {
+    const wire = matchCompletionRoute(req.method, url.pathname);
+    if (!wire) {
       // Self-documenting 404: echo the path/method and list the valid endpoints,
       // so a wrong URL (e.g. "/v1/v1/chat/completions" or a GET) is obvious.
       return json(res, 404, {
@@ -930,16 +1055,16 @@ export function createServer({ bridge, config }) {
           message: "Not found",
           path: url.pathname,
           method: req.method,
-          hint:
-            "Valid endpoints: POST /v1/chat/completions (chat), GET /v1/models (models), GET / (GUI), GET /health. " +
-            "Set base_url to http://127.0.0.1:20140/v1 and DO NOT append /v1 again; chat must use POST.",
+          hint: ENDPOINT_HINT,
         },
       });
     }
 
     const rate = limiter.allow(clientKey);
     if (!rate.allowed) {
-      return json(res, 429, { error: { message: "Rate limit exceeded", type: "rate_limited" } }, { "Retry-After": String(rate.retryAfter) });
+      const retry = { "Retry-After": String(rate.retryAfter) };
+      if (wire === "messages") return json(res, 429, anthropicErrorBody({ message: "Rate limit exceeded", status: 429 }), retry);
+      return json(res, 429, { error: { message: "Rate limit exceeded", type: "rate_limited" } }, retry);
     }
 
     const requestId = crypto.randomUUID();
@@ -952,14 +1077,42 @@ export function createServer({ bridge, config }) {
     // Set when a streaming (SSE) response has been opened early; used by the
     // catch below to report errors in-band once headers are already sent.
     let sseHeartbeat = null;
+    let responseStream = null;
+    let anthropicStream = null;
     try {
       const body = await readBody(req);
-      const validationError = validateCompletion(body);
+      let chatBody = body;
+      if (wire === "responses") {
+        const translated = responsesToChat(body);
+        if (translated.error) {
+          bridge.runtime.errors += 1;
+          return json(res, 400, { error: { message: translated.error, type: "invalid_request_error", request_id: requestId } }, responseHeaders);
+        }
+        const prior = body.previous_response_id ? responseMemory.get(String(body.previous_response_id)) : null;
+        if (prior) translated.chat.messages = continueFromPrevious(prior, translated.chat.messages);
+        chatBody = translated.chat;
+      } else if (wire === "messages") {
+        const translated = anthropicToChat(body);
+        if (translated.error) {
+          bridge.runtime.errors += 1;
+          return json(res, 400, anthropicErrorBody({ message: translated.error, status: 400 }, requestId), responseHeaders);
+        }
+        chatBody = translated.chat;
+      }
+      const validationError = validateCompletion(chatBody);
       if (validationError) {
         bridge.runtime.errors += 1;
+        if (wire === "messages") {
+          return json(res, 400, anthropicErrorBody({ message: validationError, status: 400 }, requestId), responseHeaders);
+        }
         return json(res, 400, { error: { message: validationError, type: "invalid_request_error", request_id: requestId } }, responseHeaders);
       }
-      log.info("server", "chat completion request", { requestId, messages: body.messages.length, stream: body.stream === true });
+      log.info("server", "chat completion request", {
+        requestId,
+        wire,
+        messages: chatBody.messages.length,
+        stream: chatBody.stream === true,
+      });
       // Which workspace hint arrived. Codex is expected to send its session id,
       // which the bridge traces back to the directory that session ran in; when
       // this is absent the workspace cannot be recovered at all, so it is worth
@@ -967,70 +1120,21 @@ export function createServer({ bridge, config }) {
       log.info("server", "workspace hints", {
         requestId,
         codexSessionId: String(req.headers["x-codex-session-id"] || "").trim() || null,
+        claudeSessionId: String(req.headers["x-claude-code-session-id"] || "").trim() || null,
         workspaceHeader: String(req.headers["x-arena-workspace"] || "").trim() || null,
         headersSeen: Object.keys(req.headers).filter((h) => h.startsWith("x-")).join(","),
       });
-      // Architecture split: a UUID `model` means "converse with this existing
-      // Arena session" (converse-only, never creates a session — that is owned
-      // by the Arena模型助手 real browser). model "active" (or omitted) targets
-      // the session picked in the GUI. Any other non-UUID `model` falls back to
-      // the legacy omni runAgent flow (which may create a session).
-      const model = (body.model || "active").trim();
-      // Which conversation the caller thinks it is having, if it tells us.
-      const clientSid = clientSessionId(req.headers);
-      let target = null;
-      if (isSessionId(model)) {
-        target = model;
-        // Passing a UUID is an explicit choice: remember it, so a later
-        // request that omits `model` lands on the same Session (and keeps
-        // its context) instead of drifting to whatever the GUI picked since.
-        if (clientSid) {
-          poolState = bind(poolState, clientSid, target, new Date().toISOString());
-          savePoolState(config, poolState);
-        }
-      } else if (model === "active") {
-        // "active" (or an omitted model) means "use the session picked in the
-        // GUI". If nothing is picked, fail with a CLEAR, actionable 409 instead
-        // of silently falling back to the legacy runAgent flow (which tries to
-        // create a session and is blocked by reCAPTCHA — see §4.10/§4.11).
-        if (clientSid) {
-          const bound = resolveBinding(poolState, clientSid);
-          if (bound.ok) {
-            target = bound.sessionId;
-          } else if (bound.code === "bound_session_dead") {
-            // Never substitute another Session: context lives on the bound one,
-            // so silently switching would answer with a different conversation.
-            throw Object.assign(
-              new Error(
-                `Your bound session ${bound.sessionId} is marked suspected-dead. ` +
-                  'Pick another session (GUI → 选用此模型, or pass its UUID as model), ' +
-                  `or POST /api/pool/unbind with clientId "${clientSid}" to drop the binding.`
-              ),
-              { status: 409, code: "bound_session_dead" }
-            );
-          }
-        }
-        // A Binding is only ever created by an EXPLICIT choice (passing a session
-        // UUID as `model`). "active" is not a choice, so it does not bind —
-        // otherwise a client that merely omits `model` would get frozen to
-        // whichever session the GUI happened to have selected.
-        if (!target) {
-          if (!activeSession) throw noActiveSessionError();
-          target = activeSession;
-        }
-      }
-      // Resolve the owning Account BEFORE any response is opened. Streaming
-      // clients get their 200 + SSE headers up front (§4.13.9), so anything
-      // thrown later is delivered mid-stream and reads as "connection dropped"
-      // instead of as the 409 it actually is. Resolving here keeps it clean.
-      const accountEmail = target ? sessionAccountEmail(config.archiveDir, target) : "";
-      let account = null;
-      if (target) account = bridge.credentials.forSession(accountEmail);
+      // Architecture split lives in prepareChatTurn: a UUID `model` converses
+      // with that Arena session, "active" uses the GUI pick, and any other
+      // name on the chat wire falls through to legacy runAgent. Responses and
+      // Messages already rewrote foreign model ids to "active" in the translator.
+      // Account resolution happens before any SSE headers so a 409 stays a 409.
+      const prepared = prepareChatTurn(chatBody, req.headers);
       // Streaming clients get the SSE response opened IMMEDIATELY — before we
       // drive the (slow) Arena round-trip — plus a keep-alive heartbeat. Without
       // this the client sees zero bytes for 17-180s and aborts with a timeout
       // (exactly what cliproxyapi's stream:true health check hits — see §4.13.9).
-      const streaming = body.stream === true;
+      const streaming = chatBody.stream === true;
       const streamId = `chatcmpl-arena-${requestId}`;
       const streamCreated = Math.floor(Date.now() / 1000);
       let streamedAny = false;
@@ -1046,13 +1150,17 @@ export function createServer({ bridge, config }) {
               id: streamId,
               object: "chat.completion.chunk",
               created: streamCreated,
-              model: model || "active",
+              model: prepared.model || "active",
               choices: [{ index: 0, delta, finish_reason: finish }],
             })}\n\n`
           );
         } catch {
           /* client already gone */
         }
+      };
+      const writeSse = (chunk) => {
+        if (res.writableEnded) return;
+        try { res.write(chunk); } catch { /* client already gone */ }
       };
       if (streaming) {
         res.writeHead(200, {
@@ -1062,64 +1170,46 @@ export function createServer({ bridge, config }) {
           Connection: "keep-alive",
           ...responseHeaders,
         });
-        // First frame is a VALID OpenAI chunk (not a bare ": comment"), so even a
-        // strict SSE/JSON decoder sees something parseable from the first byte.
-        writeChunk({ role: "assistant", content: "" });
-        // Keep-alives are VALID empty-delta EVENTS (not comments) and now run for
-        // the WHOLE turn — including the quiet stretches while Arena executes a
-        // tool — so no layer in between can judge the stream as stalled (§4.32/§4.35).
-        sseHeartbeat = setInterval(() => {
-          if (!res.writableEnded) writeChunk({});
-        }, 10_000);
+        if (wire === "chat") {
+          // First frame is a VALID OpenAI chunk (not a bare ": comment"), so even a
+          // strict SSE/JSON decoder sees something parseable from the first byte.
+          writeChunk({ role: "assistant", content: "" });
+          // Keep-alives are VALID empty-delta EVENTS (not comments) and now run for
+          // the WHOLE turn — including the quiet stretches while Arena executes a
+          // tool — so no layer in between can judge the stream as stalled (§4.32/§4.35).
+          sseHeartbeat = setInterval(() => {
+            if (!res.writableEnded) writeChunk({});
+          }, 10_000);
+        } else if (wire === "responses") {
+          responseStream = createResponseStream(writeSse, {
+            id: `resp_${requestId}`,
+            model: prepared.model || "active",
+            created: streamCreated,
+          });
+          sseHeartbeat = setInterval(() => {
+            if (!res.writableEnded) writeSse(": ping\n\n");
+          }, 10_000);
+        } else {
+          anthropicStream = createAnthropicStream(writeSse, {
+            id: `msg_${requestId}`,
+            model: prepared.model || "active",
+          });
+          anthropicStream.start();
+          sseHeartbeat = setInterval(() => anthropicStream.ping(), 10_000);
+        }
         sseHeartbeat.unref?.();
       }
-      const onDelta = streaming
-        ? (text) => {
-            streamedAny = true;
-            writeChunk({ content: text });
-          }
-        : null;
-      let payload;
-      if (model === "ping" || model === "health") {
-        // Lightweight probe model: a VALID completion INSTANTLY, without touching
-        // the (slow) headed browser. Point a health/probe model here so it never
-        // queues behind multi-minute Arena work.
-        payload = {
-          id: `chatcmpl-arena-ping-${Date.now()}`,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        };
-      } else if (target) {
-        turnsInFlight += 1;
-        try {
-          // The owning Account was resolved before the stream opened, so a
-          // disabled owner has already become a clean 409 by now.
-          payload = await bridge.converse(target, body, { onDelta, headers: req.headers, account, accountEmail });
-          poolState = markUsed(poolState, target, new Date().toISOString());
-        } catch (error) {
-          // A real failure is the only trusted dead signal — never a timeout,
-          // never an age heuristic. See docs/agents + spec 0001.
-          poolState = markDead(poolState, target, new Date().toISOString());
-          savePoolState(config, poolState);
-          throw error;
-        } finally {
-          turnsInFlight -= 1;
-        }
-        savePoolState(config, poolState);
-      } else {
-        // Counted like the Session path above. It drives the same page a turn
-        // does, so an unwatched run here is what lets an on-demand quota read
-        // (which refuses only while turnsInFlight > 0) land on it mid-run.
-        turnsInFlight += 1;
-        try {
-          payload = await bridge.runAgent(body, req.headers);
-        } finally {
-          turnsInFlight -= 1;
-        }
-      }
+      const onDelta = !streaming
+        ? null
+        : wire === "chat"
+          ? (text) => {
+              streamedAny = true;
+              writeChunk({ content: text });
+            }
+          : wire === "responses"
+            ? (text) => responseStream.delta(text)
+            : (text) => anthropicStream.delta(text);
+      const payload = await executeChatTurn(prepared, chatBody, req.headers, onDelta);
       if (sseHeartbeat) {
         clearInterval(sseHeartbeat);
         sseHeartbeat = null;
@@ -1132,22 +1222,41 @@ export function createServer({ bridge, config }) {
       const hasToolCalls = Array.isArray(payload?.choices?.[0]?.message?.tool_calls);
       if (hasToolCalls) bridge.runtime.toolResponses += 1;
       else bridge.runtime.textResponses += 1;
+      if (wire === "responses") rememberResponse(`resp_${requestId}`, chatBody.messages, payload);
       if (streaming) {
-        const message = payload?.choices?.[0]?.message || {};
-        if (!streamedAny) {
-          // Nothing was pushed while reading (tool-call turn, error turn, or a
-          // path that produced text only at the end) — emit it as one chunk so
-          // the stream still carries the answer. §4.33
-          const streamedCalls = Array.isArray(message.tool_calls)
-            ? message.tool_calls.map((call, index) => ({ index, ...call }))
-            : null;
-          if (message.reasoning_content) writeChunk({ reasoning_content: message.reasoning_content });
-          if (streamedCalls) writeChunk({ content: message.content ?? null, tool_calls: streamedCalls });
-          else if (message.content) writeChunk({ content: message.content });
+        if (wire === "chat") {
+          const message = payload?.choices?.[0]?.message || {};
+          if (!streamedAny) {
+            // Nothing was pushed while reading (tool-call turn, error turn, or a
+            // path that produced text only at the end) — emit it as one chunk so
+            // the stream still carries the answer. §4.33
+            const streamedCalls = Array.isArray(message.tool_calls)
+              ? message.tool_calls.map((call, index) => ({ index, ...call }))
+              : null;
+            if (message.reasoning_content) writeChunk({ reasoning_content: message.reasoning_content });
+            if (streamedCalls) writeChunk({ content: message.content ?? null, tool_calls: streamedCalls });
+            else if (message.content) writeChunk({ content: message.content });
+          }
+          writeChunk({}, payload?.choices?.[0]?.finish_reason || "stop");
+          res.write("data: [DONE]\n\n");
+          return res.end();
         }
-        writeChunk({}, payload?.choices?.[0]?.finish_reason || "stop");
-        res.write("data: [DONE]\n\n");
+        if (wire === "responses") responseStream.complete(payload);
+        else anthropicStream.complete(payload);
         return res.end();
+      }
+      if (wire === "responses") {
+        return json(res, 200, chatToResponse(payload, {
+          id: `resp_${requestId}`,
+          model: prepared.model || payload?.model || "active",
+          created: streamCreated,
+        }), responseHeaders);
+      }
+      if (wire === "messages") {
+        return json(res, 200, chatToAnthropic(payload, {
+          id: `msg_${requestId}`,
+          model: prepared.model || payload?.model || "active",
+        }), responseHeaders);
       }
       return json(res, 200, payload, responseHeaders);
     } catch (error) {
@@ -1180,14 +1289,21 @@ export function createServer({ bridge, config }) {
       // HTTP status, so report the failure in-band as an SSE error event.
       if (res.headersSent) {
         try {
-          // Standard OpenAI-style in-band error frame — plain `data:` only (no
-          // custom event name) so strict stream decoders don't choke.
-          res.write(`data: ${JSON.stringify(errorBody)}\n\n`);
-          res.write("data: [DONE]\n\n");
+          if (wire === "responses") responseStream?.fail(error);
+          else if (wire === "messages") anthropicStream?.fail(error);
+          else {
+            // Standard OpenAI-style in-band error frame — plain `data:` only (no
+            // custom event name) so strict stream decoders don't choke.
+            res.write(`data: ${JSON.stringify(errorBody)}\n\n`);
+            res.write("data: [DONE]\n\n");
+          }
         } catch {
           /* client already gone */
         }
         return res.end();
+      }
+      if (wire === "messages") {
+        return json(res, status, anthropicErrorBody(error, requestId), { ...retryAfter, ...responseHeaders });
       }
       return json(res, status, errorBody, { ...retryAfter, ...responseHeaders });
     }

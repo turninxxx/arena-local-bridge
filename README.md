@@ -39,6 +39,8 @@ It binds to `127.0.0.1` by default and exposes:
 | `GET /ready` | Account readiness; HTTP 503 until an account is usable |
 | `GET /v1/models` | Local model list |
 | `POST /v1/chat/completions` | OpenAI-compatible chat |
+| `POST /v1/responses` | OpenAI Responses API (Codex `wire_api=responses`) |
+| `POST /v1/messages` | Anthropic Messages API (Claude Code) |
 | `GET /` | Local operations UI |
 
 ## Requirements
@@ -101,6 +103,52 @@ curl -X POST http://127.0.0.1:20140/v1/chat/completions \
 ~~~
 
 A stable `x-codex-session-id` keeps one persistent Arena session per client conversation.
+
+### Codex (Responses API)
+
+Codex desktop and CLI call `POST /v1/responses`. Add a provider that points at this bridge:
+
+~~~toml
+model = "active"
+model_provider = "arena"
+
+[model_providers.arena]
+name = "Arena Local Bridge"
+base_url = "http://127.0.0.1:20140/v1"
+wire_api = "responses"
+env_key = "ARENA_AGENT_BRIDGE_KEY"
+requires_openai_auth = false
+~~~
+
+`base_url` ends in `/v1`. Codex then POSTs `/v1/responses` with `stream: true` and reads the SSE events (`response.output_text.delta`, function-call argument events, `response.output_item.done`, `response.completed`).
+
+`model` in that file can be `active` (the session selected in the GUI) or an archived Arena session UUID. Any other model id Codex sends — for example `gpt-5.4` — is also treated as `active` on this route. Chat completions is unchanged: a non-UUID model there still uses the legacy agent flow.
+
+The bridge does not keep a durable Responses store. Codex with `store` left off replays the full `input` on every turn (instructions, messages, `function_call`, and `function_call_output`). That replay is what continues a tool-call loop on the same Arena session. `previous_response_id` is accepted: while this process still remembers that response (the last 32), a follow-up that sends only the new tail is stitched onto the stored transcript. After a restart, or when the id is unknown, only the `input` on that request is used. Keep `x-codex-session-id` stable so the bridge stays on one Arena conversation.
+
+~~~bash
+curl -X POST http://127.0.0.1:20140/v1/responses \
+  -H "Authorization: Bearer $ARENA_AGENT_BRIDGE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"active","input":"Hello"}'
+~~~
+
+### Claude Code (Anthropic Messages API)
+
+Claude Code appends `/v1/messages` itself, so the base URL is the bridge origin with no `/v1` suffix:
+
+~~~bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:20140"
+export ANTHROPIC_API_KEY="$ARENA_AGENT_BRIDGE_KEY"
+export ANTHROPIC_AUTH_TOKEN="$ARENA_AGENT_BRIDGE_KEY"
+claude
+~~~
+
+`Authorization: Bearer` and `x-api-key` both carry the bridge key; either header is enough. Non-streaming JSON and the Anthropic SSE sequence (`message_start`, `content_block_delta`, `message_delta`, `message_stop`) are both supported, including `tool_use` / `tool_result` turns.
+
+Each request already contains the full `messages` transcript, which is what the bridge sends to Arena. `x-claude-code-session-id` pins the Arena session the same way `x-codex-session-id` does. A model id that is not a session UUID is treated as `active`, so pick a session in the GUI (or pass the UUID as `model`).
+
+`GET /health` and `GET /api/status` list `POST /v1/responses` and `POST /v1/messages` next to chat completions.
 
 ## Features
 
