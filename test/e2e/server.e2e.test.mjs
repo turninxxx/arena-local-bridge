@@ -6,7 +6,7 @@
 // behavior, never model intelligence.
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, utimesSync } from "node:fs";
 import path from "node:path";
 import { VERSION } from "../../src/version.mjs";
 import { startE2E, httpRequest, authHeaders, waitFor, BRIDGE_KEY, SESSION_ID } from "./helper.mjs";
@@ -796,6 +796,104 @@ describe("POST /v1/messages", () => {
       assert.equal(second.json.type, "error");
       assert.equal(second.json.error.type, "rate_limit_error");
       assert.ok(Number(second.headers["retry-after"]) > 0);
+    } finally { await e2e.close(); }
+  });
+});
+
+describe("POST /api/archive/sessions — manual add", () => {
+  const ADDED = "22222222-3333-4444-8555-666666666666";
+
+  function postSession(port, body, headers = authHeaders({ "Content-Type": "application/json" })) {
+    return httpRequest(port, { method: "POST", reqPath: "/api/archive/sessions", headers, body });
+  }
+
+  test("the route requires the bridge key", async () => {
+    const e2e = await startE2E();
+    try {
+      const res = await postSession(e2e.port, { session: ADDED }, {});
+      assert.equal(res.status, 401);
+      assert.equal(res.json.error.message, "Invalid bridge key");
+    } finally { await e2e.close(); }
+  });
+
+  test("an invalid id, a link with no session, and a duplicate are rejected", async () => {
+    const e2e = await startE2E();
+    try {
+      const invalid = await postSession(e2e.port, { session: "not-a-uuid" });
+      assert.equal(invalid.status, 400);
+      assert.equal(invalid.json.error.code, "invalid_session");
+
+      const missing = await postSession(e2e.port, { session: "https://arena.ai/c/nope" });
+      assert.equal(missing.status, 404);
+      assert.equal(missing.json.error.code, "not_found");
+
+      const duplicate = await postSession(e2e.port, { sessionId: SESSION_ID.toUpperCase() });
+      assert.equal(duplicate.status, 409);
+      assert.equal(duplicate.json.error.code, "already_present");
+
+      const junk = await postSession(e2e.port, "{");
+      assert.equal(junk.status, 400);
+      assert.equal(junk.json.error.code, "invalid_session");
+    } finally { await e2e.close(); }
+  });
+
+  test("a pasted agent URL is stored like a harvested session and shows up in the lists", async () => {
+    const e2e = await startE2E({
+      bridge: {
+        credentials: {
+          list: () => [
+            { email: "off@example.com", disabled: true },
+            { email: "owner@example.com", disabled: false },
+          ],
+          primary: () => ({ email: "owner@example.com" }),
+          forSession: (email) => ({ email: email || "owner@example.com" }),
+        },
+      },
+    });
+    try {
+      const res = await postSession(e2e.port, {
+        session: `https://www.arena.ai/agent/${ADDED}?ref=1`,
+        label: "gpt-5",
+        note: "手抄",
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.ok, true);
+      assert.equal(res.json.sessionId, ADDED);
+      assert.equal(res.json.model, "gpt-5");
+      assert.equal(res.json.url, `https://arena.ai/agent/${ADDED}`);
+
+      const listed = await httpRequest(e2e.port, { reqPath: "/api/sessions" });
+      assert.equal(listed.status, 200);
+      const added = listed.json.sessions.find((session) => session.sessionId === ADDED);
+      assert.ok(added, "the new session must appear next to harvested ones");
+      assert.equal(added.model, "gpt-5");
+      assert.equal(added.prompt, "手抄");
+      assert.equal(added.email, "owner@example.com");
+      assert.ok(listed.json.sessions.some((session) => session.sessionId === SESSION_ID));
+      assert.ok(listed.json.groups.some((group) => group.model === "gpt-5" && group.sessions.some((session) => session.sessionId === ADDED)));
+
+      const models = await httpRequest(e2e.port, { reqPath: "/v1/models", headers: authHeaders() });
+      const model = models.json.data.find((entry) => entry.id === ADDED);
+      assert.ok(model);
+      assert.equal(model.name, "gpt-5");
+      assert.equal(model.owned_by, "arena-session");
+
+      const stored = JSON.parse(readFileSync(path.join(e2e.config.archiveDir, "记录.json"), "utf8"));
+      const row = stored.find((entry) => String(entry.Url).includes(ADDED));
+      assert.equal(row.Source, "arena-bridge");
+      assert.equal(row.Prompt, "手抄");
+      assert.equal(row.Email, "owner@example.com");
+      assert.equal(row.Model, "gpt-5");
+    } finally { await e2e.close(); }
+  });
+
+  test("an unset archive directory is the same error harvest reports", async () => {
+    const e2e = await startE2E({ config: { archiveDir: "" } });
+    try {
+      const res = await postSession(e2e.port, { session: ADDED });
+      assert.equal(res.status, 400);
+      assert.equal(res.json.error.code, "archive_unconfigured");
+      assert.match(res.json.error.message, /ARENA_ARCHIVE_DIR/);
     } finally { await e2e.close(); }
   });
 });

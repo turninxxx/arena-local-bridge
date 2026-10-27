@@ -165,7 +165,7 @@ claude
   受 bridge key 保护的 `GET /api/mcp/workspaces` 按时间倒序返回最多十个去重候选，形状为
   `{ workspace, lastWriteAt }`（ISO 时间），不含 transcript 内容或文件名。Codex sessions 目录不存在时
   返回空数组，界面保留原有的恢复提示。
-- **采集与批量测试** —— 批量创建与驱动 Session。
+- **采集与批量测试** —— 批量创建与驱动 Session。已有会话也可以手动加入同一份归档：在「连抽采集」或「模型归档 / 可选 session」粘贴 session UUID 或 `https://arena.ai/agent/<uuid>` 链接，可选填写模型名和备注。写入 `ARENA_ARCHIVE_DIR` 下的 `记录.json`，与连抽采集使用同一条记录。
 - **本地运维界面** —— Session、模型池、绑定、账号与额度一目了然。
 
 启动本地 MCP 时，在 GUI 填写已有工作区的绝对目录，或设置 `ARENA_MCP_WORKSPACE`。
