@@ -1384,7 +1384,7 @@ function bindManualAdd(formId, fields) {
   if (!form) return;
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    addManualSession(fields);
+    return addManualSession(fields);
   });
 }
 
