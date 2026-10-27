@@ -58,7 +58,13 @@ test("sessionKey resolves explicit headers first", () => {
 });
 
 test("shared client-session headers are ordered and skip blank values", () => {
-  assert.deepEqual(CLIENT_SESSION_HEADERS, ["x-codex-session-id", "x-session-id", "x-omniroute-session"]);
+  assert.deepEqual(CLIENT_SESSION_HEADERS, [
+    "x-codex-session-id",
+    "x-session-id",
+    "x-omniroute-session",
+    "x-claude-code-session-id",
+  ]);
+  assert.equal(sessionKey({ messages: [{ role: "user", content: "x" }] }, { "x-claude-code-session-id": "claude-1" }), "claude-1");
   assert.equal(firstHeader({
     "x-codex-session-id": "  ",
     "x-session-id": " session-2 ",

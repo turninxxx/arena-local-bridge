@@ -39,6 +39,8 @@
 | `GET /ready` | 账号就绪检查；账号尚不可用时返回 HTTP 503 |
 | `GET /v1/models` | 本地模型列表 |
 | `POST /v1/chat/completions` | OpenAI 兼容聊天接口 |
+| `POST /v1/responses` | OpenAI Responses API（Codex `wire_api=responses`） |
+| `POST /v1/messages` | Anthropic Messages API（Claude Code） |
 | `GET /` | 本地运维界面 |
 
 ## 环境要求
@@ -100,6 +102,52 @@ curl -X POST http://127.0.0.1:20140/v1/chat/completions \
 ~~~
 
 `x-codex-session-id` 保持不变，就能让每个客户端对话对应一段持久化的 Arena Session。
+
+### Codex（Responses API）
+
+Codex 桌面版和 CLI 调用 `POST /v1/responses`。在配置里增加一个指向本 bridge 的 provider：
+
+~~~toml
+model = "active"
+model_provider = "arena"
+
+[model_providers.arena]
+name = "Arena Local Bridge"
+base_url = "http://127.0.0.1:20140/v1"
+wire_api = "responses"
+env_key = "ARENA_AGENT_BRIDGE_KEY"
+requires_openai_auth = false
+~~~
+
+`base_url` 以 `/v1` 结尾。Codex 会向 `/v1/responses` 发 `stream: true`，并读取 SSE 事件（`response.output_text.delta`、函数调用参数事件、`response.output_item.done`、`response.completed`）。
+
+这里的 `model` 可以是 `active`（GUI 里选中的 session）或归档里的 Arena session UUID。Codex 发来的其他模型名（例如 `gpt-5.4`）在这条路由上同样按 `active` 处理。Chat Completions 保持原样：非 UUID 的 model 仍走原来的 legacy agent 流程。
+
+Bridge 不持久保存 Responses 状态。Codex 在关闭 `store` 时会在每一轮重放完整 `input`（instructions、消息、`function_call` 和 `function_call_output`）。工具调用循环靠的就是这份重放，Arena 会话本身不变。`previous_response_id` 会被接受：进程还记得该响应时（最近 32 条），只带新增尾巴的后续请求会接到已保存的对话后面。重启之后，或 id 已经不在内存里时，只使用该请求自己的 `input`。`x-codex-session-id` 保持不变，bridge 就会停在同一段 Arena 对话上。
+
+~~~bash
+curl -X POST http://127.0.0.1:20140/v1/responses \
+  -H "Authorization: Bearer $ARENA_AGENT_BRIDGE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"active","input":"Hello"}'
+~~~
+
+### Claude Code（Anthropic Messages API）
+
+Claude Code 会自己拼接 `/v1/messages`，所以 base URL 是 bridge 的源站，不要加 `/v1`：
+
+~~~bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:20140"
+export ANTHROPIC_API_KEY="$ARENA_AGENT_BRIDGE_KEY"
+export ANTHROPIC_AUTH_TOKEN="$ARENA_AGENT_BRIDGE_KEY"
+claude
+~~~
+
+`Authorization: Bearer` 和 `x-api-key` 都携带 bridge key，任一请求头匹配即可。非流式 JSON 和 Anthropic SSE（`message_start`、`content_block_delta`、`message_delta`、`message_stop`）都支持，包括 `tool_use` / `tool_result` 回合。
+
+每个请求已经带上完整的 `messages` 记录，bridge 把这份记录交给 Arena。`x-claude-code-session-id` 与 `x-codex-session-id` 一样，用来钉住 Arena session。不是 session UUID 的 model 会按 `active` 处理，因此先在 GUI 里选用 session，或把 UUID 当作 `model` 传入。
+
+`GET /health` 和 `GET /api/status` 会把 `POST /v1/responses` 和 `POST /v1/messages` 与 chat completions 列在一起。
 
 ## 功能
 

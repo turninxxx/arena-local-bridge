@@ -193,7 +193,12 @@ export function formatMessages(messages, includeTools, tools, profile) {
  * identity, or a binding would point at a different conversation than the one
  * the rest of the bridge keys on.
  */
-export const CLIENT_SESSION_HEADERS = ["x-codex-session-id", "x-session-id", "x-omniroute-session"];
+export const CLIENT_SESSION_HEADERS = [
+  "x-codex-session-id",
+  "x-session-id",
+  "x-omniroute-session",
+  "x-claude-code-session-id",
+];
 
 /** First non-empty value among `names`, or "". */
 export function firstHeader(headers, names) {

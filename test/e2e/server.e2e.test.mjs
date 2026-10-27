@@ -30,6 +30,9 @@ describe("open edges (no key required)", () => {
       assert.equal(res.json.accounts[0].quota, null, "a fresh pool state has no cached reading yet");
       assert.equal(res.json.bridgeKey, undefined);
       assert.equal(res.json.apiKey, undefined);
+      assert.ok(res.json.endpoints.includes("POST /v1/responses"));
+      assert.ok(res.json.endpoints.includes("POST /v1/messages"));
+      assert.ok(res.json.endpoints.includes("POST /v1/chat/completions"));
     } finally { await e2e.close(); }
   });
 
@@ -39,6 +42,8 @@ describe("open edges (no key required)", () => {
       const res = await httpRequest(e2e.port, { reqPath: "/" });
       assert.equal(res.status, 200);
       assert.match(res.headers["content-type"], /text\/html/);
+      assert.match(res.text, /\/v1\/responses/);
+      assert.match(res.text, /\/v1\/messages/);
     } finally { await e2e.close(); }
   });
 });
@@ -72,6 +77,8 @@ describe("the loopback defense", () => {
       const res = await httpRequest(local.port, { reqPath: "/api/status", headers: authHeaders() });
       assert.equal(res.status, 200);
       assert.equal(res.json.apiKey, BRIDGE_KEY);
+      assert.equal(res.json.responsesEndpoint, `http://127.0.0.1:${local.port}/v1/responses`);
+      assert.equal(res.json.messagesEndpoint, `http://127.0.0.1:${local.port}/v1/messages`);
     } finally { await local.close(); }
 
     const foreign = await startE2E({ config: { host: "0.0.0.0", bindHost: "127.0.0.1" } });
@@ -264,6 +271,8 @@ describe("validation and error shapes", () => {
       assert.equal(res.json.error.method, "GET");
       assert.equal(res.json.error.path, "/v1/chat/completions");
       assert.match(res.json.error.hint, /POST/);
+      assert.match(res.json.error.hint, /\/v1\/responses/);
+      assert.match(res.json.error.hint, /\/v1\/messages/);
     } finally { await e2e.close(); }
   });
 
@@ -471,5 +480,322 @@ describe("POST /api/mcp/reinject — the manual entry for a session whose worksp
     assert.equal(res.status, 400);
     const noKey = await httpRequest(ctx.port, { method: "POST", reqPath: "/api/mcp/reinject", headers: { "Content-Type": "application/json" }, body: { sessionId: SESSION_ID } });
     assert.equal(noKey.status, 401);
+  });
+});
+
+function parseSse(text) {
+  const events = [];
+  for (const frame of text.split(/\n\n/)) {
+    const trimmed = frame.trim();
+    if (!trimmed || trimmed.startsWith(":")) continue;
+    let eventName = "";
+    const data = [];
+    for (const line of trimmed.split("\n")) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim();
+      else if (line.startsWith("data:")) data.push(line.slice(5).trim());
+    }
+    if (!data.length) continue;
+    events.push({ event: eventName, data: JSON.parse(data.join("\n")) });
+  }
+  return events;
+}
+
+const TOOL_REPLY = {
+  object: "chat.completion",
+  choices: [{
+    index: 0,
+    message: {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_ls", type: "function", function: { name: "Bash", arguments: "{\"command\":\"ls\"}" } }],
+    },
+    finish_reason: "tool_calls",
+  }],
+  usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+};
+
+describe("POST /v1/responses", () => {
+  test("bearer auth translates input into the chat driver and maps a tool call back", async () => {
+    const seen = [];
+    const e2e = await startE2E({
+      bridge: {
+        converse: async (sessionId, body) => {
+          seen.push({ sessionId, body });
+          return TOOL_REPLY;
+        },
+      },
+    });
+    try {
+      const res = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/responses",
+        headers: authHeaders(),
+        body: {
+          model: SESSION_ID,
+          instructions: "be brief",
+          input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "list files" }] }],
+          tools: [{ type: "function", name: "Bash", description: "run", parameters: { type: "object", properties: { command: { type: "string" } } } }],
+        },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.object, "response");
+      assert.equal(res.json.status, "completed");
+      assert.equal(res.json.store, false);
+      const call = res.json.output.find((item) => item.type === "function_call");
+      assert.equal(call.name, "Bash");
+      assert.equal(call.call_id, "call_ls");
+      assert.equal(call.arguments, "{\"command\":\"ls\"}");
+      assert.equal(seen[0].sessionId, SESSION_ID);
+      assert.equal(seen[0].body.messages[0].role, "system");
+      assert.equal(seen[0].body.messages[1].content, "list files");
+      assert.equal(seen[0].body.tools[0].function.name, "Bash");
+      assert.equal(e2e.bridge.calls.runAgent.length, 0);
+    } finally { await e2e.close(); }
+  });
+
+  test("a Codex model name uses the GUI session, and x-api-key is accepted", async () => {
+    const e2e = await startE2E();
+    try {
+      const picked = await httpRequest(e2e.port, { method: "POST", reqPath: "/api/active-session", body: { sessionId: SESSION_ID } });
+      assert.equal(picked.status, 200);
+      const res = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/responses",
+        headers: { "x-api-key": BRIDGE_KEY },
+        body: { model: "gpt-5.4", input: "hello" },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(e2e.bridge.calls.converse[0].sessionId, SESSION_ID);
+      assert.equal(e2e.bridge.calls.converse[0].body.model, "active");
+      assert.equal(e2e.bridge.calls.runAgent.length, 0);
+    } finally { await e2e.close(); }
+  });
+
+  test("previous_response_id stitches a tool result onto the stored transcript", async () => {
+    const seen = [];
+    const e2e = await startE2E({
+      bridge: {
+        converse: async (sessionId, body) => {
+          seen.push(body.messages);
+          if (body.messages.some((message) => message.role === "tool")) {
+            return {
+              object: "chat.completion",
+              choices: [{ index: 0, message: { role: "assistant", content: "done" }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            };
+          }
+          return TOOL_REPLY;
+        },
+      },
+    });
+    try {
+      const first = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/responses",
+        headers: authHeaders(),
+        body: { model: SESSION_ID, input: "list files", tools: [{ type: "function", name: "Bash", parameters: { type: "object" } }] },
+      });
+      assert.equal(first.status, 200);
+      const second = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/responses",
+        headers: authHeaders(),
+        body: {
+          model: SESSION_ID,
+          previous_response_id: first.json.id,
+          input: [{ type: "function_call_output", call_id: "call_ls", output: "a.txt" }],
+        },
+      });
+      assert.equal(second.status, 200);
+      assert.equal(second.json.output[0].content[0].text, "done");
+      const roles = seen[1].map((message) => message.role);
+      assert.deepEqual(roles, ["user", "assistant", "tool"]);
+      assert.equal(seen[1][0].content, "list files");
+      assert.equal(seen[1][2].content, "a.txt");
+      assert.equal(seen[1][2].tool_call_id, "call_ls");
+    } finally { await e2e.close(); }
+  });
+
+  test("streaming emits Responses SSE and keeps the chat route's chunks unchanged", async () => {
+    const e2e = await startE2E({
+      bridge: {
+        converse: async (_sid, _body, opts = {}) => {
+          if (opts.onDelta) opts.onDelta("partial ");
+          return {
+            object: "chat.completion",
+            choices: [{ index: 0, message: { role: "assistant", content: "partial answer" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          };
+        },
+      },
+    });
+    try {
+      const res = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/responses",
+        headers: authHeaders(),
+        body: { model: SESSION_ID, input: "hi", stream: true },
+      });
+      assert.equal(res.status, 200);
+      assert.match(res.headers["content-type"], /text\/event-stream/);
+      const events = parseSse(res.text);
+      const deltas = events.filter((event) => event.data.type === "response.output_text.delta").map((event) => event.data.delta);
+      assert.deepEqual(deltas, ["partial ", "answer"]);
+      assert.equal(events.at(-1).data.type, "response.completed");
+      assert.equal(events.at(-1).data.response.status, "completed");
+    } finally { await e2e.close(); }
+  });
+
+  test("ping does not drive the browser", async () => {
+    const e2e = await startE2E();
+    try {
+      const res = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/responses",
+        headers: authHeaders(),
+        body: { model: "ping", input: "hi" },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.output[0].content[0].text, "pong");
+      assert.equal(e2e.bridge.calls.converse.length, 0);
+      assert.equal(e2e.bridge.calls.runAgent.length, 0);
+    } finally { await e2e.close(); }
+  });
+});
+
+describe("POST /v1/messages", () => {
+  test("x-api-key auth maps Anthropic messages and returns tool_use", async () => {
+    const seen = [];
+    const e2e = await startE2E({
+      bridge: {
+        converse: async (sessionId, body) => {
+          seen.push({ sessionId, body });
+          return TOOL_REPLY;
+        },
+      },
+    });
+    try {
+      const missing = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/messages",
+        body: { model: SESSION_ID, max_tokens: 16, messages: [{ role: "user", content: "hi" }] },
+      });
+      assert.equal(missing.status, 401);
+      assert.equal(missing.json.error.type, "authentication_error");
+      const res = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/messages",
+        headers: { "x-api-key": BRIDGE_KEY, "anthropic-version": "2023-06-01" },
+        body: {
+          model: "claude-sonnet-4-5",
+          max_tokens: 64,
+          system: "be brief",
+          messages: [{ role: "user", content: [{ type: "text", text: "list files" }] }],
+          tools: [{ name: "Bash", description: "run", input_schema: { type: "object", properties: { command: { type: "string" } } } }],
+        },
+      });
+      assert.equal(res.status, 409);
+      assert.equal(res.json.error.code, "no_active_session");
+      const picked = await httpRequest(e2e.port, { method: "POST", reqPath: "/api/active-session", body: { sessionId: SESSION_ID } });
+      assert.equal(picked.status, 200);
+      const ok = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/messages",
+        headers: { Authorization: "Bearer wrong", "x-api-key": BRIDGE_KEY },
+        body: {
+          model: "claude-sonnet-4-5",
+          max_tokens: 64,
+          system: "be brief",
+          messages: [{ role: "user", content: [{ type: "text", text: "list files" }] }],
+          tools: [{ name: "Bash", description: "run", input_schema: { type: "object", properties: { command: { type: "string" } } } }],
+        },
+      });
+      assert.equal(ok.status, 200);
+      assert.equal(ok.json.type, "message");
+      assert.equal(ok.json.stop_reason, "tool_use");
+      assert.equal(ok.json.content[0].type, "tool_use");
+      assert.equal(ok.json.content[0].id, "call_ls");
+      assert.deepEqual(ok.json.content[0].input, { command: "ls" });
+      assert.equal(seen[0].sessionId, SESSION_ID);
+      assert.equal(seen[0].body.messages[0].content, "be brief");
+      assert.equal(seen[0].body.messages[1].content, "list files");
+      assert.equal(seen[0].body.tools[0].function.name, "Bash");
+    } finally { await e2e.close(); }
+  });
+
+  test("x-claude-code-session-id keeps a later active turn on the same session", async () => {
+    const e2e = await startE2E();
+    try {
+      const headers = { "x-api-key": BRIDGE_KEY, "x-claude-code-session-id": "claude-session-1" };
+      const first = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/messages",
+        headers,
+        body: { model: SESSION_ID, max_tokens: 8, messages: [{ role: "user", content: "hi" }] },
+      });
+      assert.equal(first.status, 200);
+      const second = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/messages",
+        headers,
+        body: { model: "claude-sonnet-4-5", max_tokens: 8, messages: [{ role: "user", content: "next" }] },
+      });
+      assert.equal(second.status, 200);
+      assert.deepEqual(e2e.bridge.calls.converse.map((call) => call.sessionId), [SESSION_ID, SESSION_ID]);
+    } finally { await e2e.close(); }
+  });
+
+  test("streaming emits Anthropic SSE through message_stop", async () => {
+    const e2e = await startE2E({
+      bridge: {
+        converse: async (_sid, _body, opts = {}) => {
+          if (opts.onDelta) opts.onDelta("Hi");
+          return {
+            object: "chat.completion",
+            choices: [{ index: 0, message: { role: "assistant", content: "Hi there" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+          };
+        },
+      },
+    });
+    try {
+      const res = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/messages?beta=true",
+        headers: authHeaders(),
+        body: { model: SESSION_ID, max_tokens: 16, messages: [{ role: "user", content: "hi" }], stream: true },
+      });
+      assert.equal(res.status, 200);
+      assert.match(res.headers["content-type"], /text\/event-stream/);
+      const events = parseSse(res.text);
+      assert.equal(events[0].event, "message_start");
+      const text = events.filter((event) => event.data.delta?.type === "text_delta").map((event) => event.data.delta.text);
+      assert.deepEqual(text, ["Hi", " there"]);
+      assert.equal(events.find((event) => event.event === "message_delta").data.delta.stop_reason, "end_turn");
+      assert.equal(events.at(-1).event, "message_stop");
+    } finally { await e2e.close(); }
+  });
+
+  test("a messages rate limit uses the Anthropic error shape", async () => {
+    const e2e = await startE2E({ config: { rateLimitRpm: 1 } });
+    try {
+      const first = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/messages",
+        headers: authHeaders(),
+        body: { model: "ping", max_tokens: 4, messages: [{ role: "user", content: "hi" }] },
+      });
+      assert.equal(first.status, 200);
+      const second = await httpRequest(e2e.port, {
+        method: "POST",
+        reqPath: "/v1/messages",
+        headers: authHeaders(),
+        body: { model: "ping", max_tokens: 4, messages: [{ role: "user", content: "hi" }] },
+      });
+      assert.equal(second.status, 429);
+      assert.equal(second.json.type, "error");
+      assert.equal(second.json.error.type, "rate_limit_error");
+      assert.ok(Number(second.headers["retry-after"]) > 0);
+    } finally { await e2e.close(); }
   });
 });

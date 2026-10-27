@@ -1158,8 +1158,10 @@ function renderConn(status) {
     field("model · 推荐填 active（自动指向当前选中模型）", "active", "modelActive") +
     field("model · 或填此 UUID（客户端不认 active 别名时用）", status.model, "model") +
     field("Chat 端点", `${o}/v1/chat/completions`, "chat") +
+    field("Responses 端点（Codex，wire_api=responses）", `${o}/v1/responses`, "responses") +
+    field("Messages 端点（Claude Code / Anthropic）", `${o}/v1/messages`, "messages") +
     codeBlock("示例 curl（用 active）", sampleCurl(o, status.apiKey, "active")) +
-    `<div class="hint">客户端把 base_url 设为 <code>${o}/v1</code>，model 填 <b>active</b> 或上面 UUID；流式加 <code>"stream":true</code>。</div>`;
+    `<div class="hint">Chat Completions：base_url 设为 <code>${o}/v1</code>，model 填 <b>active</b> 或上面 UUID；流式加 <code>"stream":true</code>。Codex：同一 base_url，<code>wire_api = "responses"</code>。Claude Code：<code>ANTHROPIC_BASE_URL=${o}</code>（不要加 /v1），API key 填本机 bridge key。</div>`;
   wire(box);
 }
 
