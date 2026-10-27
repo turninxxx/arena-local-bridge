@@ -266,6 +266,20 @@
   #toast.err { background: #a13b33; border-color: #8a2f28; }
   #toast.err .ico { color: #ffd2ce; }
 
+  /* Delete confirmation. Lives on <body>, not in the session list, so a refresh
+     cannot remove it. Native confirm() is closed by the browser on navigation
+     and when the tab is hidden. */
+  dialog.confirm-dialog {
+    border: 1px solid var(--line-2); border-radius: var(--radius); padding: 16px 18px 14px;
+    max-width: min(440px, calc(100vw - 32px)); background: var(--panel); color: var(--txt);
+    box-shadow: 0 18px 50px rgba(23, 37, 29, .18);
+  }
+  dialog.confirm-dialog::backdrop { background: rgba(23, 37, 29, .38); }
+  dialog.confirm-dialog h3 { margin: 0 0 8px; font-size: 15px; color: #1b2a22; }
+  dialog.confirm-dialog p { margin: 0 0 8px; font-size: 13.5px; }
+  dialog.confirm-dialog ul { margin: 0; padding-left: 18px; color: var(--dim); font-size: 12.5px; line-height: 1.55; }
+  dialog.confirm-dialog .row { margin: 14px 0 0; justify-content: flex-end; }
+
   /* ── ModelPool board ─────────────────────────────────────────────────── */
   .poolbar { display: flex; gap: 8px; align-items: center; margin: 0 0 10px; flex-wrap: wrap; }
   .poolbar input[type="search"] {
@@ -393,7 +407,7 @@
           <button class="btn-ghost btn-sm" id="selAll">全选</button>
           <button class="btn-ghost btn-sm" id="selNone">清空</button>
           <span class="muted" id="selCount">已选 0 个</span>
-          <button class="btn-ghost btn-sm" id="selDel">删除所选</button>
+          <button type="button" class="btn-ghost btn-sm" id="selDel">删除所选</button>
         </div>
         <div class="poolbar">
           <input type="search" id="poolSearch" placeholder="搜索模型 / UUID / 账号" aria-label="搜索模型池" />
@@ -648,6 +662,20 @@
   </section>
 </main>
 
+<dialog id="deleteConfirm" class="confirm-dialog" aria-labelledby="deleteConfirmText">
+  <h3>确认删除</h3>
+  <p id="deleteConfirmText"></p>
+  <ul>
+    <li>会从本地归档 记录.json 里永久移除，无法撤销</li>
+    <li>它们在 Arena 侧仍然存在，只是这里不再记录</li>
+    <li>指向它们的绑定会一并解除</li>
+  </ul>
+  <div class="row">
+    <button type="button" class="btn-ghost" id="deleteConfirmCancel">取消</button>
+    <button type="button" class="btn-danger" id="deleteConfirmOk">确认删除</button>
+  </div>
+</dialog>
+
 <script>
 const $ = (s) => document.querySelector(s);
 const SELECTED = new Set();
@@ -715,7 +743,11 @@ function wire(root) {
     b.addEventListener("click", () => verifySession(b));
   });
   root.querySelectorAll(".del-btn").forEach((b) => {
-    b.addEventListener("click", () => deleteSessions([b.dataset.sid]));
+    b.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      deleteSessions([b.dataset.sid]);
+    });
   });
   root.querySelectorAll(".reprobe-btn").forEach((b) => {
     b.addEventListener("click", () => reprobeSession(b));
@@ -855,7 +887,7 @@ function sessionCard(s, active) {
         </button>
         <button class="btn-ghost btn-sm verify-btn" data-sid="${escapeHtml(s.sessionId)}">体检</button>
         ${unresolved ? `<button class="btn-ghost btn-sm reprobe-btn" data-sid="${escapeHtml(s.sessionId)}">补标</button>` : ""}
-        <button class="btn-ghost btn-sm del-btn" data-sid="${escapeHtml(s.sessionId)}">删除</button>
+        <button type="button" class="btn-ghost btn-sm del-btn" data-sid="${escapeHtml(s.sessionId)}">删除</button>
       </div>
       <div class="sc-url">Arena URL（仅供参考，<b>勿在你自己浏览器打开</b>）：<br>${escapeHtml(s.url)}</div>
     </article>`;
@@ -1001,16 +1033,39 @@ async function reprobeSession(btn) {
 // 删除 is the only irreversible action in this GUI, and 记录.json is the only
 // record these Sessions have — so it always confirms first, and the wording
 // says plainly that Arena's side is untouched (we cannot remove that).
+//
+// The prompt is an in-page <dialog> on <body>, not window.confirm(). Chromium
+// dismisses confirm() as soon as the tab hides or the document navigates, which
+// looks like the dialog flashing closed before anyone can answer. render()
+// replaces #sessions and must not be able to remove this node.
+let deleteConfirmTask = null;
+let deleteConfirmResolver = null;
+function settleDeleteConfirm(ok) {
+  const resolve = deleteConfirmResolver;
+  deleteConfirmResolver = null;
+  deleteConfirmTask = null;
+  const dialog = $("#deleteConfirm");
+  if (dialog && dialog.open && typeof dialog.close === "function") dialog.close();
+  if (resolve) resolve(ok);
+}
+function askDeleteConfirm(count) {
+  const dialog = $("#deleteConfirm");
+  const text = `确认删除 ${count} 条 session？`;
+  if ($("#deleteConfirmText")) $("#deleteConfirmText").textContent = text;
+  if (deleteConfirmTask) return deleteConfirmTask;
+  const task = new Promise((resolve) => { deleteConfirmResolver = resolve; });
+  deleteConfirmTask = task;
+  if (dialog && typeof dialog.showModal === "function") {
+    if (!dialog.open) dialog.showModal();
+    return task;
+  }
+  settleDeleteConfirm(window.confirm(text + "\n\n· 会从本地归档 记录.json 里永久移除，无法撤销\n· 它们在 Arena 侧仍然存在，只是这里不再记录\n· 指向它们的绑定会一并解除"));
+  return task;
+}
 async function deleteSessions(ids) {
   const list = [...new Set((ids || []).filter(Boolean))];
   if (!list.length) { toast("先勾选要删除的 session", true); return; }
-  const ok = window.confirm(
-    `确认删除 ${list.length} 条 session？\n\n` +
-      "· 会从本地归档 记录.json 里永久移除，无法撤销\n" +
-      "· 它们在 Arena 侧仍然存在，只是这里不再记录\n" +
-      "· 指向它们的绑定会一并解除"
-  );
-  if (!ok) return;
+  if (!(await askDeleteConfirm(list.length))) return;
   try {
     const r = await keyPost("/api/pool/delete", { sessionIds: list });
     if (r && r.error) { toast("删除失败：" + r.error.message, true); return; }
@@ -1515,7 +1570,22 @@ $("#selAll").addEventListener("click", () => selectAll(true));
 $("#selNone").addEventListener("click", () => selectAll(false));
 $("#quotaRefresh").addEventListener("click", () => refreshQuota($("#quotaRefresh")));
 $("#accountLoginForm").addEventListener("submit", loginAccount);
-$("#selDel").addEventListener("click", () => deleteSessions([...SELECTED]));
+$("#selDel").addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  deleteSessions([...SELECTED]);
+});
+$("#deleteConfirmCancel").addEventListener("click", () => settleDeleteConfirm(false));
+$("#deleteConfirmOk").addEventListener("click", () => settleDeleteConfirm(true));
+$("#deleteConfirm").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  settleDeleteConfirm(false);
+});
+$("#deleteConfirm").addEventListener("click", (event) => {
+  // Backdrop clicks (target is the dialog itself) must not dismiss. The click
+  // that opened the prompt can land here once the top layer appears.
+  if (event.target === $("#deleteConfirm")) event.stopPropagation();
+});
 $("#selAll2").addEventListener("click", () => selectAll(true));
 $("#selNone2").addEventListener("click", () => selectAll(false));
 render();
