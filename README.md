@@ -168,7 +168,7 @@ Each request already contains the full `messages` transcript, which is what the 
   The bridge-key-protected `GET /api/mcp/workspaces` returns up to ten distinct candidates, newest first,
   as `{ workspace, lastWriteAt }` (ISO timestamp), without transcript contents or filenames. A missing Codex
   sessions directory returns an empty array, and the existing recovery hint remains available.
-- **Harvesting and batch testing** — create and drive many sessions at once.
+- **Harvesting and batch testing** — create and drive many sessions at once. An existing session can also be added by hand from **连抽采集** or **模型归档 / 可选 session**: paste a session UUID or an `https://arena.ai/agent/<uuid>` link, with an optional model name and note. It is stored in `ARENA_ARCHIVE_DIR/记录.json`, the same archive record harvest writes.
 - **Local operations UI** — sessions, pools, bindings, accounts and quota at a glance.
 
 To start Local MCP, enter an existing absolute workspace in the GUI, or set `ARENA_MCP_WORKSPACE`.

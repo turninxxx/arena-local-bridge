@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { log } from "./util.mjs";
 import { AgentDockManager } from "./agentdock.mjs";
 import { LocalMcpRuntime } from "./local-mcp-runtime.mjs";
-import { stats as archiveStats, readEntries, removeEntries, sessionAccountEmail, sessionIdFromUrl, updateModel } from "./archive.mjs";
+import { stats as archiveStats, readEntries, registerManualSession, removeEntries, sessionAccountEmail, sessionIdFromUrl, updateModel } from "./archive.mjs";
 import { Harvester } from "./harvest.mjs";
 import { BatchTest } from "./batchtest.mjs";
 import { readSnapshot } from "./probe/index.mjs";
@@ -943,6 +943,56 @@ export function createServer({ bridge, config }) {
           error: {
             message: error instanceof Error ? error.message : String(error),
             ...(error?.code ? { code: error.code } : {}),
+          },
+        });
+      }
+    }
+
+    // ── 手动登记已有 session ─────────────────────────────────────────────
+    // Same 记录.json row harvest writes (appendEntry). No Arena round trip:
+    // the operator already has the session, and 体检 / 补标 can check it later.
+    if (req.method === "POST" && url.pathname === "/api/archive/sessions") {
+      let body;
+      try {
+        body = await readBody(req);
+      } catch (error) {
+        return json(res, Number(error.status || 400), {
+          error: { message: "请求体不是合法 JSON", code: "invalid_session" },
+        });
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return json(res, 400, { error: { message: "request body must be a JSON object", code: "invalid_session" } });
+      }
+      const session = body.session ?? body.url ?? body.sessionId ?? "";
+      const model = body.model ?? body.label ?? "";
+      const note = body.note ?? "";
+      let email = "";
+      try {
+        const accounts = bridge.credentials?.list?.() || [];
+        const usable = accounts.find((account) => account && account.email && !account.disabled);
+        email = usable ? String(usable.email).trim() : "";
+      } catch {
+        email = "";
+      }
+      try {
+        const result = registerManualSession(config.archiveDir, { session, model, note, email });
+        if (!result.ok) {
+          return json(res, result.status, { error: { message: result.error, code: result.code } });
+        }
+        batch.sessions = readArchiveSessions(config.archiveDir);
+        log.info("server", "manual session added", { sessionId: result.sessionId, model: result.record.Model });
+        return json(res, 200, {
+          ok: true,
+          sessionId: result.sessionId,
+          model: result.record.Model,
+          url: result.record.Url,
+          title: result.record.Title,
+        });
+      } catch (error) {
+        return json(res, 500, {
+          error: {
+            message: error instanceof Error ? error.message : String(error),
+            code: "archive_write_failed",
           },
         });
       }

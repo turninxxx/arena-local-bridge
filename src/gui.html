@@ -375,6 +375,20 @@
             刷新
           </button>
         </div>
+        <form id="addSessionForm" autocomplete="off">
+          <div class="hint" style="margin:0 0 10px">手动添加已有 session：粘贴 UUID 或 <code>https://arena.ai/agent/…</code> 链接，不必连抽。模型名留空会归入「未识别」，之后可以补标。</div>
+          <div class="form-row">
+            <label style="flex:2 1 240px"><span>Session UUID 或链接</span><input type="text" id="addSession" name="session" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" maxlength="2048" autocomplete="off" spellcheck="false" /></label>
+            <label><span>模型名（可选）</span><input type="text" id="addModel" name="model" placeholder="不知道就留空" maxlength="120" /></label>
+          </div>
+          <div class="form-row">
+            <label><span>备注（可选）</span><input type="text" id="addNote" name="note" placeholder="例如：从浏览器复制的会话" maxlength="2000" /></label>
+          </div>
+          <div class="row" style="margin-bottom:12px">
+            <button class="btn-primary" id="addSessionBtn" type="submit">添加到归档</button>
+            <span class="muted" id="addSessionStatus" role="status" aria-live="polite"></span>
+          </div>
+        </form>
         <div class="selbar">
           <button class="btn-ghost btn-sm" id="selAll">全选</button>
           <button class="btn-ghost btn-sm" id="selNone">清空</button>
@@ -549,6 +563,33 @@
       </div>
       <div class="progress"><i id="hvBar"></i></div>
       <div class="log" id="hvLog"><span class="muted">未开始。</span></div>
+    </section>
+
+    <section class="panel" style="margin-top:12px">
+      <div class="panel-head">
+        <div class="panel-title">
+          <span class="ico" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 5v14" /><path d="M5 12h14" />
+            </svg>
+          </span>
+          <h2>手动添加已有 session</h2>
+        </div>
+      </div>
+      <form id="hvAddSessionForm" autocomplete="off">
+        <div class="hint" style="margin:0 0 10px">登记一条已经存在的 Arena 会话，写入和连抽相同的归档。粘贴 session UUID，或 <code>https://arena.ai/agent/…</code> 链接。模型名留空时记为「未识别」。</div>
+        <div class="form-row">
+          <label style="flex:2 1 240px"><span>Session UUID 或链接</span><input type="text" id="hvAddSession" name="session" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" maxlength="2048" autocomplete="off" spellcheck="false" /></label>
+          <label><span>模型名（可选）</span><input type="text" id="hvAddModel" name="model" placeholder="不知道就留空" maxlength="120" /></label>
+        </div>
+        <div class="form-row">
+          <label><span>备注（可选）</span><input type="text" id="hvAddNote" name="note" placeholder="例如：从浏览器复制的会话" maxlength="2000" /></label>
+        </div>
+        <div class="row" style="margin-bottom:0">
+          <button class="btn-primary" id="hvAddSessionBtn" type="submit">添加到归档</button>
+          <span class="muted" id="hvAddSessionStatus" role="status" aria-live="polite"></span>
+        </div>
+      </form>
     </section>
   </section>
 
@@ -872,7 +913,7 @@ function renderPools(payload, status) {
   }
   if (!GROUPS.length) {
     box.innerHTML = emptyState(ICON.inbox, "未读到 session",
-      `请确认 <code>ARENA_ARCHIVE_DIR</code> 指向「模型归档」目录（含 记录.json）。<br>当前：${escapeHtml((payload && payload.archiveDir) || "(未设置)")}`);
+      `请确认 <code>ARENA_ARCHIVE_DIR</code> 指向「模型归档」目录（含 记录.json），或在上方手动添加已有 session。<br>当前：${escapeHtml((payload && payload.archiveDir) || "(未设置)")}`);
   } else {
     const groups = sortGroups(GROUPS.filter((g) => poolMatches(g, needle)), POOL_SORT);
     box.innerHTML = groups.length
@@ -986,7 +1027,7 @@ function renderPickList() {
   const box = $("#pickList");
   if (!box) return;
   if (!SESSIONS.length) {
-    box.innerHTML = '<div style="padding:10px"><span class="muted">归档里还没有 session。</span></div>';
+    box.innerHTML = '<div style="padding:10px"><span class="muted">归档里还没有 session。可在「模型归档」或「连抽采集」里手动添加。</span></div>';
     return;
   }
   box.innerHTML = SESSIONS.map((s) => `
@@ -1337,6 +1378,56 @@ async function hvStop() {
   await hvStatus();
 }
 
+/* ── 手动添加已有 session ─────────────────────────────────────────────── */
+function bindManualAdd(formId, fields) {
+  const form = $("#" + formId);
+  if (!form) return;
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    addManualSession(fields);
+  });
+}
+
+async function addManualSession(fields) {
+  const sessionEl = $(fields.session);
+  const modelEl = $(fields.model);
+  const noteEl = $(fields.note);
+  const button = $(fields.button);
+  const status = $(fields.status);
+  const session = sessionEl.value.trim();
+  const model = modelEl.value.trim();
+  const note = noteEl.value.trim();
+  if (!session) {
+    status.textContent = "请填写 session UUID，或 Arena 会话链接。";
+    toast(status.textContent, true);
+    sessionEl.focus();
+    return;
+  }
+  button.disabled = true;
+  status.textContent = "正在写入归档…";
+  try {
+    const result = await keyPost("/api/archive/sessions", { session, model, note });
+    if (!result || result.error) {
+      const message = (result && result.error && result.error.message) || "添加失败";
+      status.textContent = message;
+      toast(message, true);
+      return;
+    }
+    sessionEl.value = "";
+    modelEl.value = "";
+    noteEl.value = "";
+    status.textContent = "已加入归档" + (result.model ? " · " + result.model : "");
+    toast("已加入归档");
+    await loadStats();
+    await render();
+  } catch (error) {
+    status.textContent = error.message;
+    toast("添加失败：" + error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /* ── 批量测试 ─────────────────────────────────────────────────────────── */
 let tsTimer = null;
 async function tsStatus() {
@@ -1416,6 +1507,8 @@ $("#mcpWorkspaceCancel").addEventListener("click", () => {
 $("#refresh").addEventListener("click", render);
 $("#hvStart").addEventListener("click", hvStart);
 $("#hvStop").addEventListener("click", hvStop);
+bindManualAdd("addSessionForm", { session: "#addSession", model: "#addModel", note: "#addNote", button: "#addSessionBtn", status: "#addSessionStatus" });
+bindManualAdd("hvAddSessionForm", { session: "#hvAddSession", model: "#hvAddModel", note: "#hvAddNote", button: "#hvAddSessionBtn", status: "#hvAddSessionStatus" });
 $("#tsStart").addEventListener("click", tsStart);
 $("#tsStop").addEventListener("click", tsStop);
 $("#selAll").addEventListener("click", () => selectAll(true));

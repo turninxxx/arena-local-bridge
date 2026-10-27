@@ -66,6 +66,112 @@ export function sessionIdFromUrl(url) {
   return m ? m[1].toLowerCase() : "";
 }
 
+// Same shape server.isSessionId accepts. Kept here so a hand-pasted id is
+// archived only when the converse driver would later recognise it as a session.
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AGENT_UUID = /\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f-])/i;
+const MODEL_MAX = 120;
+const NOTE_MAX = 2000;
+const SESSION_INPUT_MAX = 2048;
+
+function failSession(code, error) {
+  return { ok: false, code, error };
+}
+
+/** Trim a pasted UUID or URL. Angle brackets and quotes are what a chat paste adds. */
+function unwrapSessionInput(input) {
+  let raw = String(input ?? "").trim();
+  if (raw.startsWith("<") && raw.endsWith(">")) raw = raw.slice(1, -1).trim();
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1).trim();
+  }
+  return raw;
+}
+
+function looksLikeLink(raw) {
+  return /:\/\//.test(raw) || /(?:^|\/\/|\s)(?:www\.)?arena\.ai(?:[/:?#]|$)/i.test(raw) || /\/agent(?:[/?#]|$)/i.test(raw);
+}
+
+/**
+ * Pull an Arena session id out of a bare UUID or an agent URL.
+ * A link with no `/agent/<uuid>` is `not_found`; anything else that is not a
+ * UUID is `invalid_session`. The id is always lower-case.
+ */
+export function parseSessionRef(input) {
+  const raw = unwrapSessionInput(input);
+  if (!raw) return failSession("invalid_session", "请填写 session UUID，或 Arena 会话链接。");
+  if (raw.length > SESSION_INPUT_MAX) {
+    return failSession("invalid_session", "输入过长。请只粘贴 session UUID 或 Arena 会话链接。");
+  }
+  if (SESSION_UUID.test(raw)) return { ok: true, sessionId: raw.toLowerCase() };
+  const agent = raw.match(AGENT_UUID);
+  if (agent) return { ok: true, sessionId: agent[1].toLowerCase() };
+  if (looksLikeLink(raw)) {
+    return failSession(
+      "not_found",
+      "链接里没有 Arena session id。需要形如 https://arena.ai/agent/<uuid> 的地址，或直接粘贴 UUID。"
+    );
+  }
+  return failSession("invalid_session", "session id 无效。请粘贴 UUID，或 https://arena.ai/agent/<uuid> 链接。");
+}
+
+/**
+ * Register an existing Arena session in the same 记录.json harvest writes.
+ *
+ * Does not create a session and does not talk to Arena. `model` is the archive
+ * label (blank → 未识别, same as a harvest round the probe could not name).
+ * `note` is stored in Prompt, the free-text field each row already has.
+ * Returns { ok:false, status, code, error } or { ok:true, sessionId, record }.
+ */
+export function registerManualSession(archiveDir, { session = "", model = "", note = "", email = "" } = {}) {
+  if (!archiveDir) {
+    return {
+      ok: false,
+      status: 400,
+      code: "archive_unconfigured",
+      error: "ARENA_ARCHIVE_DIR 未设置，无法写入归档",
+    };
+  }
+  const parsed = parseSessionRef(session);
+  if (!parsed.ok) {
+    return { ok: false, status: parsed.code === "not_found" ? 404 : 400, code: parsed.code, error: parsed.error };
+  }
+  const label = String(model ?? "").trim();
+  const prompt = String(note ?? "").trim();
+  if (label.length > MODEL_MAX) {
+    return { ok: false, status: 400, code: "invalid_model", error: `模型名不能超过 ${MODEL_MAX} 个字符` };
+  }
+  if (prompt.length > NOTE_MAX) {
+    return { ok: false, status: 400, code: "invalid_note", error: `备注不能超过 ${NOTE_MAX} 个字符` };
+  }
+  if (/[\u0000-\u001f]/.test(label)) {
+    return { ok: false, status: 400, code: "invalid_model", error: "模型名不能包含换行或控制字符" };
+  }
+  if (/[\u0000-\u001f]/.test(prompt)) {
+    return { ok: false, status: 400, code: "invalid_note", error: "备注不能包含换行或控制字符" };
+  }
+
+  const existing = readEntries(archiveDir).find((entry) => sessionIdFromUrl(entry.Url) === parsed.sessionId);
+  if (existing) {
+    return {
+      ok: false,
+      status: 409,
+      code: "already_present",
+      error: `该 session 已在归档中：${parsed.sessionId}`,
+      sessionId: parsed.sessionId,
+    };
+  }
+
+  const record = appendEntry(archiveDir, {
+    sessionId: parsed.sessionId,
+    model: label,
+    url: `https://arena.ai/agent/${parsed.sessionId}`,
+    email: String(email || "").trim(),
+    prompt,
+  });
+  return { ok: true, status: 200, sessionId: parsed.sessionId, record };
+}
+
 /**
  * The Account email that created a Session, or "" when the archive does not say.
  *
